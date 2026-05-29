@@ -1,0 +1,102 @@
+name: Build FRED RSS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 12 * * *"
+    - cron: "20 12 1 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Write generator script
+        run: |
+          cat > fred_master_generator.py <<'PY'
+          import json, os, urllib.parse, urllib.request
+          from pathlib import Path
+          from xml.sax.saxutils import escape
+
+          API_KEY = os.environ["FRED_API_KEY"]
+
+          SERIES = [
+              ("REAINTRATREARAT10Y", "10-Year Real Interest Rate", "daily"),
+              ("REAINTRATREARAT1YE", "1-Year Real Interest Rate", "daily"),
+              ("NFCI", "Chicago Fed National Financial Conditions Index", "daily"),
+              ("BAMLH0A0HYM2", "ICE BofA US High Yield Index Option-Adjusted Spread", "daily"),
+              ("BAA10YM", "Moody's Seasoned Baa Corporate Bond Yield Relative to 10-Year Treasury", "daily"),
+              ("T10YFF", "10-Year Treasury Minus Fed Funds Rate", "monthly"),
+          ]
+
+          def latest(series_id):
+              params = {
+                  "series_id": series_id,
+                  "api_key": API_KEY,
+                  "file_type": "json",
+                  "sort_order": "desc",
+                  "limit": 1
+              }
+              url = "https://api.stlouisfed.org/fred/series/observations?" + urllib.parse.urlencode(params)
+              with urllib.request.urlopen(url) as r:
+                  data = json.load(r)
+              obs = data["observations"][0]
+              return obs["date"], obs["value"]
+
+          Path("output").mkdir(exist_ok=True)
+
+          for cadence in ["daily", "monthly"]:
+              items = []
+              for sid, name, c in SERIES:
+                  if c != cadence:
+                      continue
+                  date, value = latest(sid)
+                  link = f"https://fred.stlouisfed.org/series/{sid}"
+                  items.append(f'''    <item>
+      <title>{escape(name)} - {escape(date)}</title>
+      <link>{escape(link)}</link>
+      <guid>{escape(sid)}-{escape(date)}</guid>
+      <description>{escape(value)}</description>
+    </item>''')
+
+              rss = f'''<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>FRED {cadence.title()} Macro Feed</title>
+    <link>https://fred.stlouisfed.org/</link>
+    <description>Latest FRED {cadence} macro indicators.</description>
+{chr(10).join(items)}
+  </channel>
+</rss>
+'''
+              Path(f"output/fred_{cadence}.rss").write_text(rss, encoding="utf-8")
+
+          Path("output/fred_series_config.json").write_text(
+              json.dumps({"series": SERIES}, indent=2),
+              encoding="utf-8"
+          )
+          PY
+
+      - name: Run generator
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python fred_master_generator.py
+
+      - name: Commit RSS files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/fred_daily.rss output/fred_monthly.rss output/fred_series_config.json
+          git diff --staged --quiet || git commit -m "Update FRED RSS feeds"
+          git push
