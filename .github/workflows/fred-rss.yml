@@ -21,6 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/configure-pages@v5
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -31,6 +33,17 @@ jobs:
         env:
           FRED_API_KEY: ${{ secrets.FED_API_KEY }}
 
+      - run: |
+          cat > public/index.html <<'EOF'
+          <!doctype html>
+          <html>
+            <body>
+              <h1>FRED RSS Feed</h1>
+              <a href="./fred-rss.xml">fred-rss.xml</a>
+            </body>
+          </html>
+          EOF
+
       - run: ls -la public
 
       - uses: actions/upload-pages-artifact@v3
@@ -40,8 +53,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
+
     environment:
       name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - uses: actions/deploy-pages@v4
+      - id: deployment
+        uses: actions/deploy-pages@v4
