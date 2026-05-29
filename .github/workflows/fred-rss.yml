@@ -29,7 +29,9 @@ jobs:
 
       - run: python generate_fred_rss.py
         env:
-          FRED_API_KEY: ${{ secrets.Fed_API_Key }}
+          FRED_API_KEY: ${{ secrets.FED_API_KEY }}
+
+      - run: ls -la public
 
       - uses: actions/upload-pages-artifact@v3
         with:
