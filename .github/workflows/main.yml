@@ -1,110 +1,319 @@
-name: Build FRED RSS
+import json
+import os
+import random
+import socket
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+import xml.sax.saxutils as saxutils
+from email.utils import format_datetime
+from datetime import datetime, timezone
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "15 12 * * *"
-    - cron: "20 12 1 * *"
+API_KEY = os.environ["FRED_API_KEY"]
+OUTPUT_FILE = "fred-master.xml"
+TMP_OUTPUT_FILE = OUTPUT_FILE + ".tmp"
 
-permissions:
-  contents: write
+SERIES = [
+    {"id": "WALCL", "title": "Fed Total Assets", "link": "https://fred.stlouisfed.org/series/WALCL"},
+    {"id": "RRPONTSYD", "title": "Reverse Repo Operations", "link": "https://fred.stlouisfed.org/series/RRPONTSYD"},
+    {"id": "WTREGEN", "title": "Treasury General Account", "link": "https://fred.stlouisfed.org/series/WTREGEN"},
+    {"id": "SOFR", "title": "SOFR", "link": "https://fred.stlouisfed.org/series/SOFR"},
+    {"id": "IORB", "title": "Interest on Reserve Balances", "link": "https://fred.stlouisfed.org/series/IORB"},
+    {"id": "EFFR", "title": "Effective Federal Funds Rate", "link": "https://fred.stlouisfed.org/series/EFFR"},
+    {"id": "DFF", "title": "Federal Funds Effective Rate", "link": "https://fred.stlouisfed.org/series/DFF"},
+    {"id": "ONRRPONTSYD", "title": "Overnight Reverse Repurchase Agreements", "link": "https://fred.stlouisfed.org/series/ONRRPONTSYD"},
+    {"id": "WRESBAL", "title": "Reserve Balances with Federal Reserve Banks", "link": "https://fred.stlouisfed.org/series/WRESBAL"},
+    {"id": "FEDFUNDS", "title": "Federal Funds Effective Rate", "link": "https://fred.stlouisfed.org/series/FEDFUNDS"},
+]
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+USER_AGENT = "fred-rss-generator/1.0"
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 8
+BASE_SLEEP = 2.0
+PER_REQUEST_PAUSE = 0.6
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+def now_utc():
+    return datetime.now(timezone.utc)
 
-      - name: Write generator script
-        run: |
-          cat > fred_master_generator.py <<'PY'
-          import json
-          import os
-          import urllib.parse
-          import urllib.request
-          from pathlib import Path
-          from xml.sax.saxutils import escape
 
-          API_KEY = os.environ["FRED_API_KEY"]
+def escape(text):
+    return saxutils.escape(str(text), {'"': "&quot;"})
 
-          SERIES = [
-              ("REAINTRATREARAT10Y", "10-Year Real Interest Rate", "daily"),
-              ("REAINTRATREARAT1YE", "1-Year Real Interest Rate", "daily"),
-              ("NFCI", "Chicago Fed National Financial Conditions Index", "daily"),
-              ("BAMLH0A0HYM2", "ICE BofA US High Yield Index Option-Adjusted Spread", "daily"),
-              ("BAA10YM", "Moody's Seasoned Baa Corporate Bond Yield Relative to 10-Year Treasury", "daily"),
-              ("T10YFF", "10-Year Treasury Minus Fed Funds Rate", "monthly"),
-          ]
 
-          def latest(series_id):
-              params = {
-                  "series_id": series_id,
-                  "api_key": API_KEY,
-                  "file_type": "json",
-                  "sort_order": "desc",
-                  "limit": 1
-              }
-              url = "https://api.stlouisfed.org/fred/series/observations?" + urllib.parse.urlencode(params)
-              with urllib.request.urlopen(url) as r:
-                  data = json.load(r)
-              obs = data["observations"][0]
-              return obs["date"], obs["value"]
+def build_url(path, **params):
+    query = urllib.parse.urlencode(params)
+    return f"https://api.stlouisfed.org{path}?{query}"
 
-          Path("output").mkdir(exist_ok=True)
 
-          for cadence in ["daily", "monthly"]:
-              items = []
-              for sid, name, c in SERIES:
-                  if c != cadence:
-                      continue
-                  date, value = latest(sid)
-                  link = f"https://fred.stlouisfed.org/series/{sid}"
-                  item = (
-                      "    <item>\\n"
-                      f"      <title>{escape(name)} - {escape(date)}</title>\\n"
-                      f"      <link>{escape(link)}</link>\\n"
-                      f"      <guid>{escape(sid)}-{escape(date)}</guid>\\n"
-                      f"      <description>{escape(value)}</description>\\n"
-                      "    </item>"
-                  )
-                  items.append(item)
+def should_retry_http(code):
+    return code in (429, 500, 502, 503, 504)
 
-              rss = (
-                  '<?xml version="1.0" encoding="UTF-8"?>\\n'
-                  '<rss version="2.0">\\n'
-                  '  <channel>\\n'
-                  f'    <title>FRED {cadence.title()} Macro Feed</title>\\n'
-                  '    <link>https://fred.stlouisfed.org/</link>\\n'
-                  f'    <description>Latest FRED {cadence} macro indicators.</description>\\n'
-                  + "\\n".join(items) + "\\n"
-                  '  </channel>\\n'
-                  '</rss>\\n'
-              )
 
-              Path(f"output/fred_{cadence}.rss").write_text(rss, encoding="utf-8")
+def compute_sleep(attempt, retry_after=None):
+    if retry_after is not None:
+        try:
+            ra = float(retry_after)
+            return max(ra, 1.0)
+        except Exception:
+            pass
+    return BASE_SLEEP * (2 ** attempt) + random.uniform(0.0, 1.25)
 
-          Path("output/fred_series_config.json").write_text(
-              json.dumps({"series": SERIES}, indent=2),
-              encoding="utf-8"
-          )
-          PY
 
-      - name: Run generator
-        env:
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        run: python fred_master_generator.py
+def fetch_json(url, max_retries=MAX_RETRIES):
+    last_err = None
 
-      - name: Commit RSS files
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output/fred_daily.rss output/fred_monthly.rss output/fred_series_config.json
-          git diff --staged --quiet || git commit -m "Update FRED RSS feeds"
-          git push
+    for attempt in range(max_retries):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw)
+
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if not should_retry_http(e.code):
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                raise RuntimeError(f"Non-retryable HTTP {e.code} for {url}: {body}") from e
+
+            if attempt == max_retries - 1:
+                break
+
+            retry_after = e.headers.get("Retry-After")
+            sleep_for = compute_sleep(attempt, retry_after)
+            print(f"[retry] HTTP {e.code} for {url} | sleep {sleep_for:.1f}s | attempt {attempt + 1}/{max_retries}")
+            time.sleep(sleep_for)
+
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionResetError) as e:
+            last_err = e
+            if attempt == max_retries - 1:
+                break
+
+            sleep_for = compute_sleep(attempt)
+            print(f"[retry] Network error for {url}: {e} | sleep {sleep_for:.1f}s | attempt {attempt + 1}/{max_retries}")
+            time.sleep(sleep_for)
+
+        except json.JSONDecodeError as e:
+            last_err = e
+            if attempt == max_retries - 1:
+                break
+
+            sleep_for = compute_sleep(attempt)
+            print(f"[retry] JSON decode error for {url}: {e} | sleep {sleep_for:.1f}s | attempt {attempt + 1}/{max_retries}")
+            time.sleep(sleep_for)
+
+    raise RuntimeError(f"Failed after retries for {url}: {last_err}") from last_err
+
+
+def latest_observation(series_id):
+    url = build_url(
+        "/fred/series/observations",
+        series_id=series_id,
+        api_key=API_KEY,
+        file_type="json",
+        sort_order="desc",
+        limit=2,
+    )
+    data = fetch_json(url)
+    observations = data.get("observations", [])
+    if not observations:
+        raise RuntimeError(f"No observations returned for {series_id}")
+
+    latest = None
+    previous = None
+
+    for obs in observations:
+        value = obs.get("value")
+        if value is None or value == ".":
+            continue
+        if latest is None:
+            latest = obs
+        elif previous is None:
+            previous = obs
+            break
+
+    if latest is None:
+        raise RuntimeError(f"No valid observation values for {series_id}")
+
+    return latest, previous
+
+
+def series_meta(series_id):
+    url = build_url(
+        "/fred/series",
+        series_id=series_id,
+        api_key=API_KEY,
+        file_type="json",
+    )
+    data = fetch_json(url)
+    series_list = data.get("seriess", [])
+    if not series_list:
+        return {}
+    return series_list[0]
+
+
+def parse_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def describe_change(current_value, previous_value):
+    cur = parse_float(current_value)
+    prev = parse_float(previous_value)
+
+    if cur is None or prev is None:
+        return f"Latest value: {current_value}"
+
+    delta = cur - prev
+    if prev == 0:
+        pct = None
+    else:
+        pct = (delta / prev) * 100.0
+
+    direction = "unchanged"
+    if delta > 0:
+        direction = "up"
+    elif delta < 0:
+        direction = "down"
+
+    delta_str = f"{delta:,.4f}".rstrip("0").rstrip(".")
+    cur_str = f"{cur:,.4f}".rstrip("0").rstrip(".")
+    prev_str = f"{prev:,.4f}".rstrip("0").rstrip(".")
+
+    if pct is None:
+        return f"Latest value: {cur_str}; previous: {prev_str}; change: {direction} {delta_str}"
+
+    pct_str = f"{pct:+.2f}%"
+    return f"Latest value: {cur_str}; previous: {prev_str}; change: {direction} {delta_str} ({pct_str})"
+
+
+def fetch_series_packet(series_cfg):
+    sid = series_cfg["id"]
+    meta = series_meta(sid)
+    time.sleep(PER_REQUEST_PAUSE)
+    latest, previous = latest_observation(sid)
+    time.sleep(PER_REQUEST_PAUSE)
+
+    title = meta.get("title") or series_cfg.get("title") or sid
+    link = series_cfg.get("link") or f"https://fred.stlouisfed.org/series/{sid}"
+    units = meta.get("units_short") or meta.get("units") or ""
+    freq = meta.get("frequency_short") or meta.get("frequency") or ""
+
+    latest_date = latest.get("date", "")
+    latest_value = latest.get("value", "")
+    previous_value = previous.get("value", "") if previous else None
+
+    summary = describe_change(latest_value, previous_value)
+    meta_bits = []
+    if units:
+        meta_bits.append(f"Units: {units}")
+    if freq:
+        meta_bits.append(f"Frequency: {freq}")
+    meta_line = " | ".join(meta_bits)
+
+    description = summary if not meta_line else f"{summary}. {meta_line}."
+
+    pub_dt = datetime.combine(
+        datetime.strptime(latest_date, "%Y-%m-%d").date(),
+        datetime.min.time(),
+        tzinfo=timezone.utc,
+    )
+
+    guid = f"{sid}:{latest_date}:{latest_value}"
+
+    return {
+        "series_id": sid,
+        "title": title,
+        "link": link,
+        "date": latest_date,
+        "value": latest_value,
+        "description": description,
+        "guid": guid,
+        "pub_dt": pub_dt,
+    }
+
+
+def build_item_xml(item):
+    title = f"{item['title']} ({item['series_id']}) - {item['value']} on {item['date']}"
+    return f"""  <item>
+    <title>{escape(title)}</title>
+    <link>{escape(item['link'])}</link>
+    <guid isPermaLink="false">{escape(item['guid'])}</guid>
+    <pubDate>{escape(format_datetime(item['pub_dt']))}</pubDate>
+    <description>{escape(item['description'])}</description>
+  </item>"""
+
+
+def build_feed(items, failures):
+    build_time = now_utc()
+    last_build = format_datetime(build_time)
+
+    channel_description = "FRED series updates collected into a single RSS feed."
+    if failures:
+        failed_ids = ", ".join(sorted(failures))
+        channel_description += f" Series skipped this run after repeated API failures: {failed_ids}."
+
+    items_xml = "\n".join(build_item_xml(item) for item in sorted(items, key=lambda x: x["pub_dt"], reverse=True))
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+  <title>FRED Master Feed</title>
+  <link>https://fred.stlouisfed.org/</link>
+  <description>{escape(channel_description)}</description>
+  <language>en-us</language>
+  <lastBuildDate>{escape(last_build)}</lastBuildDate>
+{items_xml}
+</channel>
+</rss>
+"""
+
+
+def atomic_write(path, content):
+    with open(TMP_OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    os.replace(TMP_OUTPUT_FILE, path)
+
+
+def main():
+    items = []
+    failures = []
+
+    for series_cfg in SERIES:
+        sid = series_cfg["id"]
+        try:
+            print(f"[fetch] {sid}")
+            item = fetch_series_packet(series_cfg)
+            items.append(item)
+            print(f"[ok] {sid} -> {item['date']} = {item['value']}")
+        except Exception as e:
+            failures.append(sid)
+            print(f"[skip] {sid} failed after retries: {e}")
+
+    if not items:
+        raise RuntimeError("All series failed; refusing to overwrite existing RSS with an empty feed.")
+
+    feed_xml = build_feed(items, failures)
+    atomic_write(OUTPUT_FILE, feed_xml)
+
+    print(f"[done] wrote {OUTPUT_FILE} with {len(items)} items")
+    if failures:
+        print(f"[warn] skipped series: {', '.join(failures)}")
+
+
+if __name__ == "__main__":
+    main()
