@@ -34,15 +34,8 @@ jobs:
           FRED_API_KEY: ${{ secrets.FED_API_KEY }}
 
       - run: |
-          cat > public/index.html <<'EOF'
-          <!doctype html>
-          <html>
-            <body>
-              <h1>FRED RSS Feed</h1>
-              <a href="./fred-rss.xml">fred-rss.xml</a>
-            </body>
-          </html>
-          EOF
+          echo '<h1>FRED RSS Feed</h1><a href="./fred-rss.xml">fred-rss.xml</a>' > public/index.html
+          touch public/.nojekyll
 
       - run: ls -la public
 
