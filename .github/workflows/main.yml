@@ -25,7 +25,10 @@ jobs:
       - name: Write generator script
         run: |
           cat > fred_master_generator.py <<'PY'
-          import json, os, urllib.parse, urllib.request
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
           from pathlib import Path
           from xml.sax.saxutils import escape
 
@@ -63,23 +66,28 @@ jobs:
                       continue
                   date, value = latest(sid)
                   link = f"https://fred.stlouisfed.org/series/{sid}"
-                  items.append(f'''    <item>
-      <title>{escape(name)} - {escape(date)}</title>
-      <link>{escape(link)}</link>
-      <guid>{escape(sid)}-{escape(date)}</guid>
-      <description>{escape(value)}</description>
-    </item>''')
+                  item = (
+                      "    <item>\\n"
+                      f"      <title>{escape(name)} - {escape(date)}</title>\\n"
+                      f"      <link>{escape(link)}</link>\\n"
+                      f"      <guid>{escape(sid)}-{escape(date)}</guid>\\n"
+                      f"      <description>{escape(value)}</description>\\n"
+                      "    </item>"
+                  )
+                  items.append(item)
 
-              rss = f'''<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-  <channel>
-    <title>FRED {cadence.title()} Macro Feed</title>
-    <link>https://fred.stlouisfed.org/</link>
-    <description>Latest FRED {cadence} macro indicators.</description>
-{chr(10).join(items)}
-  </channel>
-</rss>
-'''
+              rss = (
+                  '<?xml version="1.0" encoding="UTF-8"?>\\n'
+                  '<rss version="2.0">\\n'
+                  '  <channel>\\n'
+                  f'    <title>FRED {cadence.title()} Macro Feed</title>\\n'
+                  '    <link>https://fred.stlouisfed.org/</link>\\n'
+                  f'    <description>Latest FRED {cadence} macro indicators.</description>\\n'
+                  + "\\n".join(items) + "\\n"
+                  '  </channel>\\n'
+                  '</rss>\\n'
+              )
+
               Path(f"output/fred_{cadence}.rss").write_text(rss, encoding="utf-8")
 
           Path("output/fred_series_config.json").write_text(
